@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
+#include <assert.h>
 #ifndef BUDDY_PRINTF
 #include <stdio.h>
 #endif
@@ -507,6 +508,7 @@ struct buddy_embed_check {
     size_t buddy_size;
 };
 
+static inline size_t bits_for_order(uint8_t order);
 static unsigned int is_valid_alignment(size_t alignment);
 static size_t buddy_tree_order_for_memory(size_t memory_size, size_t alignment);
 static size_t depth_for_size(struct buddy *buddy, size_t requested_size);
@@ -1420,11 +1422,21 @@ static inline unsigned char compare_with_internal_position(unsigned char *bitset
 static inline void buddy_tree_track_change(struct buddy_tree* t, unsigned char* addr, size_t length);
 #endif /* BUDDY_EXPERIMENTAL_CHANGE_TRACKING */
 
+static inline size_t bits_for_order(uint8_t order) {
+    return order >= 8 ? 8 : order;
+}
+
 static inline size_t size_for_order(uint8_t order, uint8_t to) {
     size_t result = 0;
     size_t multi = 1u;
     while (order != to) {
-        result += order * multi;
+        size_t nbits = bits_for_order(order) * multi;
+        if (nbits % 8 ) {
+            nbits &= ~0b111;
+            nbits += 8;
+        }
+
+        result += nbits;
         order--;
         multi *= 2;
     }
@@ -1448,8 +1460,9 @@ static inline struct internal_position buddy_tree_internal_position_tree(
     struct internal_position p;
     size_t total_offset, local_index;
 
-    p.local_offset = t->order - buddy_tree_depth(pos) + 1;
-    total_offset = buddy_tree_size_for_order(t, (uint8_t) p.local_offset);
+    uint8_t depth = t->order - buddy_tree_depth(pos) + 1;
+    p.local_offset = bits_for_order(depth);
+    total_offset = buddy_tree_size_for_order(t, depth);
     local_index = buddy_tree_index_internal(pos);
     p.bitset_location = total_offset + (p.local_offset * local_index);
     return p;
@@ -1676,11 +1689,17 @@ static inline size_t buddy_tree_size_for_order(struct buddy_tree *t,
 
 static void write_to_internal_position(struct buddy_tree* t, struct internal_position pos, size_t value) {
     unsigned char *bitset = buddy_tree_bits(t);
-    struct bitset_range clear_range = to_bitset_range(pos.bitset_location, pos.bitset_location + pos.local_offset - 1);
+        struct bitset_range clear_range = to_bitset_range(pos.bitset_location, pos.bitset_location + pos.local_offset - 1);
+    if (pos.local_offset < 8) {
 
-    bitset_clear_range(bitset, clear_range);
-    if (value) {
-        bitset_set_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+value-1));
+        bitset_clear_range(bitset, clear_range);
+        if (value) {
+            bitset_set_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+value-1));
+        }
+    } else {
+        assert(pos.local_offset == 8);
+        assert(!(pos.bitset_location % 8));
+        bitset[pos.bitset_location / 8] = value;
     }
 
 #ifdef BUDDY_EXPERIMENTAL_CHANGE_TRACKING
@@ -1690,14 +1709,28 @@ static void write_to_internal_position(struct buddy_tree* t, struct internal_pos
 }
 
 static inline size_t read_from_internal_position(unsigned char *bitset, struct internal_position pos) {
+    if (pos.local_offset < 8) {
     if (! bitset_test(bitset, pos.bitset_location)) {
         return 0; /* Fast test without complete extraction */
     }
     return bitset_count_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+pos.local_offset-1));
+    } else {
+        assert(pos.local_offset == 8);
+        assert(!(pos.bitset_location % 8));
+
+        return bitset[pos.bitset_location / 8];
+    }
 }
 
 static inline unsigned char compare_with_internal_position(unsigned char *bitset, struct internal_position pos, size_t value) {
-    return bitset_test(bitset, pos.bitset_location+value-1);
+    if (pos.local_offset < 8) {
+        return bitset_test(bitset, pos.bitset_location+value-1);
+    } else {
+        assert(pos.local_offset == 8);
+        assert(!(pos.bitset_location % 8));
+
+        return bitset[pos.bitset_location / 8] >= value;
+    }
 }
 
 static struct buddy_tree_interval to_buddy_tree_interval(struct buddy_tree *t, struct buddy_tree_pos pos) {
