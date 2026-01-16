@@ -1396,8 +1396,9 @@ enum buddy_tree_flags {
 };
 
 struct internal_position {
-    size_t local_offset;
     size_t bitset_location;
+    uint8_t local_offset;
+    uint8_t local_fillval;
 };
 
 static inline size_t size_for_order(uint8_t order, uint8_t to);
@@ -1423,7 +1424,16 @@ static inline void buddy_tree_track_change(struct buddy_tree* t, unsigned char* 
 #endif /* BUDDY_EXPERIMENTAL_CHANGE_TRACKING */
 
 static inline size_t bits_for_order(uint8_t order) {
-    return order >= 8 ? 8 : order;
+    if (order >= 16) {
+        return 8;
+    } else if (order >= 4) {
+        return 4;
+    } else if (order >= 2) {
+        return 2;
+    } else {
+        return order;
+    }
+    // return order >= 8 ? 8 : order;
 }
 
 static inline size_t size_for_order(uint8_t order, uint8_t to) {
@@ -1432,7 +1442,7 @@ static inline size_t size_for_order(uint8_t order, uint8_t to) {
     while (order != to) {
         size_t nbits = bits_for_order(order) * multi;
         if (nbits % 8 ) {
-            nbits &= ~0b111;
+            nbits &= ~(7ULL);
             nbits += 8;
         }
 
@@ -1448,8 +1458,9 @@ static inline struct internal_position buddy_tree_internal_position_order(
     struct internal_position p;
     size_t total_offset, local_index;
 
-    p.local_offset = tree_order - buddy_tree_depth(pos) + 1;
-    total_offset = size_for_order((uint8_t) tree_order, (uint8_t) p.local_offset);
+    p.local_fillval = tree_order - buddy_tree_depth(pos) + 1;
+    p.local_offset = bits_for_order(p.local_fillval);
+    total_offset = size_for_order((uint8_t) tree_order, (uint8_t) p.local_fillval);
     local_index = buddy_tree_index_internal(pos);
     p.bitset_location = total_offset + (p.local_offset * local_index);
     return p;
@@ -1460,9 +1471,9 @@ static inline struct internal_position buddy_tree_internal_position_tree(
     struct internal_position p;
     size_t total_offset, local_index;
 
-    uint8_t depth = t->order - buddy_tree_depth(pos) + 1;
-    p.local_offset = bits_for_order(depth);
-    total_offset = buddy_tree_size_for_order(t, depth);
+    p.local_fillval = t->order - buddy_tree_depth(pos) + 1;
+    p.local_offset = bits_for_order(p.local_fillval);
+    total_offset = buddy_tree_size_for_order(t, p.local_fillval);
     local_index = buddy_tree_index_internal(pos);
     p.bitset_location = total_offset + (p.local_offset * local_index);
     return p;
@@ -1662,7 +1673,7 @@ static inline size_t buddy_tree_index_internal(struct buddy_tree_pos pos) {
     /* Clear out the highest bit, this gives us the index
      * in a row of sibling nodes */
     size_t mask = two_to_the_power_of(pos.depth - 1u);
-    size_t result = pos.index & ~mask;
+    size_t result = pos.index ^ mask;
     return result;
 }
 
@@ -1690,16 +1701,39 @@ static inline size_t buddy_tree_size_for_order(struct buddy_tree *t,
 static void write_to_internal_position(struct buddy_tree* t, struct internal_position pos, size_t value) {
     unsigned char *bitset = buddy_tree_bits(t);
         struct bitset_range clear_range = to_bitset_range(pos.bitset_location, pos.bitset_location + pos.local_offset - 1);
-    if (pos.local_offset < 8) {
-
-        bitset_clear_range(bitset, clear_range);
-        if (value) {
-            bitset_set_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+value-1));
-        }
-    } else {
+    if (pos.local_offset == 8) {
         assert(pos.local_offset == 8);
         assert(!(pos.bitset_location % 8));
         bitset[pos.bitset_location / 8] = value;
+    } else if (pos.local_offset == 4) {
+        assert((value & 0b1111) == value);
+        assert(!(pos.bitset_location % 4));
+        if (pos.bitset_location % 8) {
+            bitset[pos.bitset_location / 8] &= 0b00001111;
+            bitset[pos.bitset_location / 8] += (uint8_t)(value << 4);
+        } else {
+            bitset[pos.bitset_location / 8] &= 0b11110000;
+            bitset[pos.bitset_location / 8] += value;
+        }
+    } else if (pos.local_offset == 2) {
+        const uint8_t inv_masks[8] = {0b11111100, 0, 0b11110011, 0, 0b11001111, 0, 0b00111111, 0};
+
+        uint8_t invmask = inv_masks[pos.bitset_location % 8];
+        bitset[pos.bitset_location / 8] &= invmask;
+        bitset[pos.bitset_location / 8] += value << (pos.bitset_location % 8);
+
+    } else {
+        const uint8_t inv_masks[8] = {0b11111110, 0b11111101, 0b11111011, 0b11110111, 0b11101111, 0b11011111, 0b10111111, 0b01111111};
+        bitset[pos.bitset_location / 8] &= inv_masks[pos.bitset_location % 8];
+
+        if (value) {
+            bitset[pos.bitset_location / 8] |= 1 << (pos.bitset_location % 8);
+        }
+
+        // bitset_clear_range(bitset, clear_range);
+        // if (value) {
+        //     bitset_set_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+value-1));
+        // }
     }
 
 #ifdef BUDDY_EXPERIMENTAL_CHANGE_TRACKING
@@ -1708,28 +1742,103 @@ static void write_to_internal_position(struct buddy_tree* t, struct internal_pos
 #endif
 }
 
+static const uint8_t lut_extract1[8][256] = {
+    {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,
+0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,},
+    {0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,
+0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,},
+    {0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,
+0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1,},
+    {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,
+0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+};
+static const uint8_t lut_extract2[8][256] = {
+    {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,
+0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,},
+    {0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,
+0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,0,0,1,1,2,2,3,3,},
+    {0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,
+0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,
+0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+};
+static const uint8_t lut_extract4[8][256] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12
+,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,
+11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,},
+    {0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,
+7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,
+13,14,14,15,15,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,},
+    {0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10,11,11,11,11,12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10,11,11,11,11,
+12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10,11,11,11,11,12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7
+,7,8,8,8,8,9,9,9,9,10,10,10,10,11,11,11,11,12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,},
+    {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,9,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,
+14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,9,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,12,12
+,12,12,12,12,12,12,13,13,13,13,13,13,13,13,14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,14,14
+,14,14,14,14,14,14,14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,},
+};
+
 static inline size_t read_from_internal_position(unsigned char *bitset, struct internal_position pos) {
-    if (pos.local_offset < 8) {
-    if (! bitset_test(bitset, pos.bitset_location)) {
-        return 0; /* Fast test without complete extraction */
-    }
-    return bitset_count_range(bitset, to_bitset_range(pos.bitset_location, pos.bitset_location+pos.local_offset-1));
-    } else {
+    if (pos.local_offset == 8) {
         assert(pos.local_offset == 8);
         assert(!(pos.bitset_location % 8));
 
         return bitset[pos.bitset_location / 8];
+    } else if (pos.local_offset == 4) {
+        uint8_t val = bitset[pos.bitset_location / 8];
+
+        return lut_extract4[pos.bitset_location % 8][val];
+    } else if (pos.local_offset == 2) {
+        uint8_t val = (bitset[pos.bitset_location / 8]);
+        return lut_extract2[pos.bitset_location % 8][val];
+    } else {
+        uint8_t val = (bitset[pos.bitset_location / 8]);
+        return lut_extract1[pos.bitset_location % 8][val];
     }
 }
 
 static inline unsigned char compare_with_internal_position(unsigned char *bitset, struct internal_position pos, size_t value) {
-    if (pos.local_offset < 8) {
-        return bitset_test(bitset, pos.bitset_location+value-1);
-    } else {
+    if (pos.local_offset == 8) {
         assert(pos.local_offset == 8);
         assert(!(pos.bitset_location % 8));
 
         return bitset[pos.bitset_location / 8] >= value;
+    } else if (pos.local_offset == 4) {
+        uint8_t val = bitset[pos.bitset_location / 8];
+
+        if (pos.bitset_location % 8) {
+            return (val >> 4) >= (uint8_t)value;
+        } else {
+            return (val & 0b00001111) >= (uint8_t)value;
+        }
+    } else if (pos.local_offset == 2) {
+        return ((bitset[pos.bitset_location / 8] >> (pos.bitset_location % 8)) & 0b11) >= (uint8_t)value;
+    } else {
+        return bitset_test(bitset, pos.bitset_location+value-1);
     }
 }
 
@@ -1796,17 +1905,17 @@ static void buddy_tree_mark(struct buddy_tree *t, struct buddy_tree_pos pos) {
     struct internal_position internal = buddy_tree_internal_position_tree(t, pos);
 
     /* Mark the node as used */
-    write_to_internal_position(t, internal, internal.local_offset);
+    write_to_internal_position(t, internal, internal.local_fillval);
 
     /* Update the tree upwards */
-    update_parent_chain(t, pos, internal, internal.local_offset);
+    update_parent_chain(t, pos, internal, internal.local_fillval);
 }
 
 static enum buddy_tree_release_status buddy_tree_release(struct buddy_tree *t, struct buddy_tree_pos pos) {
     /* Calling release on an unused or a partially-used position a bug in caller */
     struct internal_position internal = buddy_tree_internal_position_tree(t, pos);
 
-    if (read_from_internal_position(buddy_tree_bits(t), internal) != internal.local_offset) {
+    if (read_from_internal_position(buddy_tree_bits(t), internal) != internal.local_fillval) {
         return BUDDY_TREE_RELEASE_FAIL_PARTIALLY_USED;
     }
 
@@ -1847,7 +1956,7 @@ static void update_parent_chain(struct buddy_tree *t, struct buddy_tree_pos pos,
 static struct buddy_tree_pos buddy_tree_find_free(struct buddy_tree *t, uint8_t target_depth) {
     struct buddy_tree_pos current_pos, left_pos, right_pos;
     uint8_t target_status;
-    size_t current_depth, right_status;
+    size_t current_depth, left_status, right_status;
     struct internal_position left_internal, right_internal;
     unsigned char *tree_bits;
 
@@ -1871,15 +1980,14 @@ static struct buddy_tree_pos buddy_tree_find_free(struct buddy_tree *t, uint8_t 
         right_internal = left_internal;
         right_internal.bitset_location += right_internal.local_offset; /* advance to the right */
 
-        if (compare_with_internal_position(tree_bits, left_internal, target_status+1)) { /* left branch is busy, pick right */
+        left_status = read_from_internal_position(tree_bits, left_internal);
+        if (left_status >= (target_status + 1)) { /* left branch is busy, pick right */
             current_pos = right_pos;
-        } else if (compare_with_internal_position(tree_bits, right_internal, target_status+1)) { /* right branch is busy, pick left */
+        } else if ((right_status = read_from_internal_position(tree_bits, right_internal), right_status >= (target_status + 1))) { /* right branch is busy, pick left */
             current_pos = left_pos;
         } else {
-            /* One of the child nodes must be read in order to compare it to its sibling. */
-            right_status = read_from_internal_position(tree_bits, right_internal);
             if (right_status) {
-                if (compare_with_internal_position(tree_bits, left_internal, right_status)) {
+                if (left_status >= right_status) {
                     current_pos = left_pos; /* Left is equal or more busy than right, prefer left */
                 } else {
                     current_pos = right_pos;
@@ -1901,7 +2009,7 @@ static bool buddy_tree_is_free(struct buddy_tree *t, struct buddy_tree_pos pos) 
         struct internal_position internal = buddy_tree_internal_position_tree(t, pos);
         size_t value = read_from_internal_position(buddy_tree_bits(t), internal);
         if (value) {
-            return value != internal.local_offset;
+            return value != internal.local_fillval;
         }
         pos = buddy_tree_parent(pos);
     }
@@ -1943,7 +2051,7 @@ static void buddy_tree_debug(struct buddy_tree *t, struct buddy_tree_pos pos,
         BUDDY_PRINTF("pos index: %zu pos depth: %zu status: %zu bitset-len: %zu bitset-at: %zu",
             state.current_pos.index, state.current_pos.depth, pos_status,
             pos_internal.local_offset, pos_internal.bitset_location);
-        if (pos_status == pos_internal.local_offset) {
+        if (pos_status == pos_internal.local_fillval) {
             BUDDY_PRINTF(" size: %zu", pos_size);
         }
         BUDDY_PRINTF("\n");
@@ -1968,7 +2076,7 @@ unsigned int buddy_tree_check_invariant(struct buddy_tree *t, struct buddy_tree_
                 violated = 1;
             }
         } else {
-            if ((current_status > 0) && (current_status < current_internal.local_offset)) {
+            if ((current_status > 0) && (current_status < current_internal.local_fillval)) {
                 violated = 1;
             }
         }
@@ -2133,9 +2241,9 @@ static size_t bitset_count_range(unsigned char *bitset, struct bitset_range rang
 
     result = popcount_byte(bitset[range.from_bucket] & bitset_char_mask[range.from_index][7])
         + popcount_byte(bitset[range.to_bucket]  & bitset_char_mask[0][range.to_index]);
-    while(++range.from_bucket != range.to_bucket) {
-        result += popcount_byte(bitset[range.from_bucket]);
-    }
+    // while(++range.from_bucket != range.to_bucket) {
+    //     result += popcount_byte(bitset[range.from_bucket]);
+    // }
     return result;
 }
 
